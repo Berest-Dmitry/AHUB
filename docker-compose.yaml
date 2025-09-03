@@ -1,0 +1,205 @@
+version: '3'
+
+volumes:
+  postgres-data:
+    driver: local
+  esdata:
+    driver: local
+  kibanadata:
+    driver: local
+  certs:
+    driver: local
+    
+secrets:
+  DbConnectionProd:
+    file: ./db_conn_prod.txt
+  JWTKey:
+    file: ./jwt_key.txt
+  MinioSecret:
+    file: ./minio_secret.txt
+  SmsApiId:
+    file: ./sms_api.txt
+
+services:
+
+  dockerapp:
+    depends_on:
+      - "ahub_db"
+      - "redis_image"
+    container_name: ahub
+    build:
+      context: .
+      dockerfile: AHUB_Test/Dockerfile
+    ports:
+      - ${APPLICATION_PORTS}
+    environment:
+      - ConnectionString=${CONNECTION_STRING}
+      - USER_SECRETS_ID=${USER_SECRETS}
+    links:
+      - "ahub_db:database"
+      - "redis_image"
+    #secrets:
+    #  - DbConnectionProd
+    #  - JWTKey
+    #  - MinioSecret
+    #  - SmsApiId
+    volumes:
+      - $APPDATA/Microsoft/UserSecrets/${USER_SECRETS}:/root/.microsoft/usersecrets/${USER_SECRETS}
+      - $HOME/.microsoft/usersecrets/${USER_SECRETS}:/root/.microsoft/usersecrets/${USER_SECRETS}
+
+
+  ahub_db:
+    image: ${POSTGRES_IMAGE}
+    container_name: ahub_db
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    ports:
+      - ${DATABASE_PORTS}
+    restart: always
+    volumes:
+      - postgres-data:${POSTGRES_VOLUME}
+
+  redis_image:
+    image: ${REDIS_IMAGE}
+    container_name: cache
+    ports:
+      - ${REDIS_PORTS}
+
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - certs:${CERTS_DIR}
+    user: "0"
+    #tty: true
+    #stdin_open: true
+    command: >
+      bash -c '
+       if [ x${ELASTIC_PASSWORD} == x ]; then
+          echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
+          exit 1;
+       elif [ x${KIBANA_PASSWORD} == x ]; then
+          echo "Set the KIBANA_PASSWORD environment variable in the .env file";
+          exit 1;
+       fi;
+       if [ ! -f config/certs/ca.zip ]; then
+         echo "Creating CA";
+         mkdir config/certs;
+         bin/elasticsearch-certutil ca  --silent --pem -out config/certs/ca.zip;
+         unzip config/certs/ca.zip -d config/certs;
+       fi;
+       if [ ! -f config/certs/certs.zip ]; then
+         echo "Creating certs";
+         echo -ne \
+         "instances:\n"\
+         "  - name: es01\n"\
+         "    dns:\n"\
+         "      - es01\n"\
+         "      - localhost\n"\
+         "    ip:\n"\
+         "      - 127.0.0.1\n"\
+         "  - name: kibana\n"\
+         "    dns:\n"\
+         "      - kibana\n"\
+         "      - localhost\n"\
+         "    ip:\n"\
+         "      - 127.0.0.1\n"\
+         > config/certs/instances.yml;
+         bin/elasticsearch-certutil cert --silent --pem --dns host.docker.internal -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+         unzip config/certs/certs.zip -d config/certs;
+       fi;
+       echo "Setting file permissions";
+       chown -R root:root config/certs;
+       find . -type d -exec chmod 750 \{\} \;;
+       find . -type f -exec chmod 640 \{\} \;;
+       echo "Waiting for Elasticsearch availability";
+       until curl -s --cacert config/certs/ca/ca.crt https://host.docker.internal:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
+       echo "Setting kibana_system password";
+       until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elasticsearch:${ELASTIC_PASSWORD}" -H "Content-Type: application/json" https://host.docker.internal:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
+       echo "All done!";
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/es01/es01.crt ]"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+
+  es:
+    container_name: es011
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      setup:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    labels:
+     co.elastic.logs/module: elasticsearch
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+      #- certs:${CERTS_DIR}
+      - ./ca.crt:${CERTS_DIR}/ca/ca.crt
+      - ./ca.key:${CERTS_DIR}/ca/ca.key
+    ports:
+      - ${ES_PORT}:9200
+    environment:
+      - node.name=es
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - xpack.security.enabled=true
+      - xpack.ml.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.license.self_generated.type=basic
+      - xpack.security.enrollment.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=${CERTS_DIR}/ca/ca.key
+      - xpack.security.http.ssl.certificate_authorities=${CERTS_DIR}/ca/ca.crt
+      - xpack.security.http.ssl.certificate=${CERTS_DIR}/ca/ca.crt
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.certificate_authorities=${CERTS_DIR}/ca/ca.crt
+      - xpack.security.transport.ssl.certificate=${CERTS_DIR}/ca/ca.crt
+      - xpack.security.transport.ssl.key=${CERTS_DIR}/ca/ca.key
+      #- xpack.security.http.ssl.keystore.path=${CERTS_DIR}/ca/ca.crt
+      #- xpack.security.http.ssl.truststore.path=${CERTS_DIR}/ca/ca.crt
+    healthcheck:
+      test: curl --cacert ${CERTS_DIR}/ca/ca.crt -s https://localhost:9200 >/dev/null; if [[ $$? == 52 ]]; then echo 0; else echo 1; fi
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+
+  kibana:
+    container_name: kib011
+    depends_on:
+      es:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    volumes:
+      - kibanadata:/usr/share/kibana/data
+      - ./ca.crt:${CERTS_DIR}/ca/ca.crt
+    ports:
+      - ${KIBANA_PORT}:5601
+    environment:
+      - SERVERNAME=kibana
+      - SERVER_PORT=${KIBANA_PORT}
+      - SERVER_HOST=0.0.0.0
+      - ELASTICSEARCH_HOSTS=https://host.docker.internal:9200
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=${CERTS_DIR}/ca/ca.crt
+      - ELASTICSEARCH_SSL_VERIFICATIONMODE=certificate
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      #- elasticsearch.security.auth.kibanaPassword=${KIBANA_PASSWORD}
+      #- elasticsearch.security.auth.createSystemUser=true
+      #- elasticsearch.security.auth.elasticPassword=${ELASTIC_PASSWORD}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+
+
